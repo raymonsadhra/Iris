@@ -58,7 +58,7 @@ class DetectionInterpreter:
                 reason="No meaningful detection above threshold",
             )
 
-        best = max(candidates, key=lambda c: c.score)
+        best = max(candidates, key=self._candidate_sort_key)
 
         # Optional urgency behavior: very large near-field person/obstacle => DANGER.
         if (
@@ -144,16 +144,20 @@ class DetectionInterpreter:
             return C.OBSTACLE
         return None
 
+    @staticmethod
+    def _candidate_sort_key(candidate: Candidate) -> tuple[float, float, float]:
+        return (candidate.score, candidate.detection.confidence, candidate.area_ratio)
+
     def _score_candidate(self, object_kind: str, confidence: float, area_ratio: float) -> float:
         # Priority is the dominant term, then confidence, then optional closeness bonus.
         priority_score = C.OBJECT_PRIORITY[object_kind]
-        confidence_score = confidence * 20.0
+        confidence_score = confidence * C.CONFIDENCE_SCORE_SCALE
 
         closeness_bonus = 0.0
         if self.config.enable_closeness:
             if area_ratio >= self.config.very_close_area_ratio:
-                closeness_bonus = 12.0
+                closeness_bonus = C.VERY_CLOSE_BONUS_SCORE
             elif area_ratio >= self.config.close_area_ratio:
-                closeness_bonus = 5.0
+                closeness_bonus = C.CLOSE_BONUS_SCORE
 
         return priority_score + confidence_score + closeness_bonus

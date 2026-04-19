@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import asdict
 
 import cv2
 
@@ -24,6 +25,8 @@ from .constants import SILENT_COMMAND, TEST_COMMAND
 from .interpreter import DetectionInterpreter, InterpreterConfig
 from .overlay import draw_overlay
 from .serial_bridge import SerialBridge, SerialConfig
+
+SERIAL_RETRY_INTERVAL_SEC = 3.0
 
 
 class IrisApp:
@@ -55,71 +58,107 @@ class IrisApp:
                 baud_rate=settings.baud_rate,
                 timeout_sec=settings.serial_timeout_sec,
             ),
-            dry_run=(dry_run_serial or no_serial),
+            dry_run=dry_run_serial,
         )
 
         self.scan_mode_enabled = settings.start_in_scan_mode
         self.no_serial = no_serial
         self.last_sent_command: str | None = None
         self.last_sent_at = 0.0
+        self.next_serial_retry_at = 0.0
+        self.shutdown_complete = False
 
     def run(self) -> None:
-        if not self.no_serial:
-            connected = self.bridge.connect()
-            if not connected:
-                print(
-                    f"[WARN] Could not connect to serial port {self.settings.serial_port}. "
-                    "Continuing without hardware output."
-                )
-
+        self._log_startup()
+        self._maybe_connect_serial(initial=True)
         print("[INFO] Iris started. Press q to quit.")
 
-        while True:
-            frame, detections = self.camera.read_and_detect()
-            h, w = frame.shape[:2]
+        try:
+            while True:
+                frame, detections = self.camera.read_and_detect()
+                h, w = frame.shape[:2]
 
-            decision = self.interpreter.interpret(detections, frame_width=w, frame_height=h)
+                decision = self.interpreter.interpret(detections, frame_width=w, frame_height=h)
 
-            if self.settings.debug and detections:
-                for line in detections_to_debug_strings(detections, frame_width=w):
-                    print("[DETECT]", line)
-                print("[DECISION]", decision.command, "|", decision.reason)
+                if self.settings.debug and detections:
+                    for line in detections_to_debug_strings(detections, frame_width=w):
+                        print("[DETECT]", line)
+                    print("[DECISION]", decision.command, "|", decision.reason)
 
-            if self.scan_mode_enabled:
-                self._maybe_send(decision.command)
+                if self.scan_mode_enabled:
+                    self._maybe_send(decision.command)
 
-            incoming = self.bridge.read_line()
-            if incoming:
-                self._handle_incoming_line(incoming)
+                incoming = self.bridge.read_line()
+                if incoming:
+                    self._handle_incoming_line(incoming)
 
-            if self.settings.enable_overlay:
-                view = draw_overlay(
-                    frame=frame,
-                    detections=detections,
-                    decision=decision,
-                    scan_mode_enabled=self.scan_mode_enabled,
-                    last_sent=self.last_sent_command,
-                )
-                cv2.imshow("Iris Debug View", view)
+                if self.settings.enable_overlay:
+                    view = draw_overlay(
+                        frame=frame,
+                        detections=detections,
+                        decision=decision,
+                        scan_mode_enabled=self.scan_mode_enabled,
+                        last_sent=self.last_sent_command,
+                    )
+                    cv2.imshow("Iris Debug View", view)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("s"):
-                self.scan_mode_enabled = not self.scan_mode_enabled
-                print(f"[INFO] Scan mode set to {self.scan_mode_enabled}")
-                if not self.scan_mode_enabled:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("s"):
+                    self.scan_mode_enabled = not self.scan_mode_enabled
+                    print(f"[INFO] Scan mode set to {self.scan_mode_enabled}")
+                    if not self.scan_mode_enabled:
+                        self._force_send(SILENT_COMMAND)
+                if key == ord("t"):
+                    self._force_send(TEST_COMMAND)
+                if key == ord("x"):
                     self._force_send(SILENT_COMMAND)
-            if key == ord("t"):
-                self._force_send(TEST_COMMAND)
-            if key == ord("x"):
-                self._force_send(SILENT_COMMAND)
+        finally:
+            self.shutdown()
 
-        self.shutdown()
+    def _log_startup(self) -> None:
+        print("[INFO] Effective settings:")
+        for key, value in asdict(self.settings).items():
+            print(f"[INFO]   {key}={value}")
+
+        if self.no_serial:
+            print("[INFO] Serial output disabled via --no-serial.")
+        elif self.bridge.dry_run:
+            print("[INFO] Serial output in dry-run mode.")
+
+        print("[INFO] Controls: [q]=quit [s]=scan toggle [t]=TEST [x]=SILENT")
+
+    def _maybe_connect_serial(self, initial: bool = False) -> bool:
+        if self.no_serial or self.bridge.dry_run or self.bridge.is_connected:
+            return self.bridge.is_connected or self.bridge.dry_run or self.no_serial
+
+        now = time.monotonic()
+        if not initial and now < self.next_serial_retry_at:
+            return False
+
+        connected = self.bridge.connect()
+        self.next_serial_retry_at = now + SERIAL_RETRY_INTERVAL_SEC
+
+        if connected:
+            print(f"[INFO] Serial connected on {self.settings.serial_port}")
+        elif initial:
+            print(
+                f"[WARN] Could not connect to serial port {self.settings.serial_port}. "
+                f"Retrying every {SERIAL_RETRY_INTERVAL_SEC:.0f}s while the app runs."
+            )
+
+        return connected
 
     def _maybe_send(self, command: str) -> None:
+        if self.no_serial:
+            return
+
         now = time.monotonic()
         if command == self.last_sent_command and (now - self.last_sent_at) < self.settings.command_cooldown_sec:
+            return
+
+        if not self.bridge.dry_run and not self.bridge.is_connected and not self._maybe_connect_serial():
             return
 
         ok = self.bridge.send_command(command)
@@ -128,7 +167,20 @@ class IrisApp:
             self.last_sent_at = now
             print(f"[SERIAL] -> {command}")
 
-    def _force_send(self, command: str) -> None:
+    def _force_send(self, command: str, allow_reconnect: bool = True) -> None:
+        if self.no_serial:
+            return
+
+        if (
+            allow_reconnect
+            and not self.bridge.dry_run
+            and not self.bridge.is_connected
+            and not self._maybe_connect_serial()
+        ):
+            return
+        if not allow_reconnect and not self.bridge.dry_run and not self.bridge.is_connected:
+            return
+
         ok = self.bridge.send_command(command)
         if ok:
             self.last_sent_command = command
@@ -144,7 +196,11 @@ class IrisApp:
             print(f"[ARDUINO] {line}")
 
     def shutdown(self) -> None:
-        self._force_send(SILENT_COMMAND)
+        if self.shutdown_complete:
+            return
+
+        self.shutdown_complete = True
+        self._force_send(SILENT_COMMAND, allow_reconnect=False)
         self.camera.close()
         self.bridge.close()
         cv2.destroyAllWindows()
@@ -164,6 +220,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-serial", action="store_true", help="Disable serial output entirely")
     parser.add_argument("--no-overlay", action="store_true", help="Disable debug overlay window")
     parser.add_argument("--quiet", action="store_true", help="Reduce debug console output")
+    parser.add_argument(
+        "--start-paused",
+        action="store_true",
+        help="Start with scan mode OFF until toggled with 's' or the hardware button",
+    )
+    parser.add_argument(
+        "--disable-closeness",
+        action="store_true",
+        help="Disable closeness bonuses and DANGER triggering for quick A/B testing",
+    )
     return parser.parse_args()
 
 
@@ -185,6 +251,10 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         settings.enable_overlay = False
     if args.quiet:
         settings.debug = False
+    if args.start_paused:
+        settings.start_in_scan_mode = False
+    if args.disable_closeness:
+        settings.enable_closeness = False
     return settings
 
 
@@ -193,11 +263,11 @@ def main() -> None:
     args = parse_args()
     settings = apply_overrides(get_settings(), args)
 
-    app = IrisApp(settings, dry_run_serial=args.dry_run_serial, no_serial=args.no_serial)
     try:
+        app = IrisApp(settings, dry_run_serial=args.dry_run_serial, no_serial=args.no_serial)
         app.run()
-    except KeyboardInterrupt:
-        app.shutdown()
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
 
 
 if __name__ == "__main__":

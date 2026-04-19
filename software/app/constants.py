@@ -24,6 +24,10 @@ OBJECT_ORDER = (PERSON, CHAIR, OBSTACLE)
 POSITION_LEFT_MAX = 0.35
 POSITION_CENTER_MAX = 0.65
 
+CONFIDENCE_SCORE_SCALE = 20.0
+CLOSE_BONUS_SCORE = 5.0
+VERY_CLOSE_BONUS_SCORE = 12.0
+
 # Priority drives which object "wins" when multiple detections appear.
 # Higher value = more likely to become the final haptic message.
 OBJECT_PRIORITY = {
@@ -53,8 +57,8 @@ PRIMARY_TARGET_LABELS = {"person", "chair"}
 DEFAULT_TARGET_LABELS = PRIMARY_TARGET_LABELS | OBSTACLE_FALLBACK_LABELS
 
 # A rough closeness estimate from bounding box area ratio.
-CLOSE_AREA_RATIO = 0.18
-VERY_CLOSE_AREA_RATIO = 0.32
+CLOSE_AREA_RATIO = 0.22
+VERY_CLOSE_AREA_RATIO = 0.40
 
 COMMANDS = {
     TEST_COMMAND,

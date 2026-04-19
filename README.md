@@ -118,10 +118,20 @@ python -m app.main --serial-port /dev/tty.usbmodem1101
 
 Useful flags:
 - `--dry-run-serial` prints commands without writing serial.
-- `--no-serial` disables serial output (vision-only demo).
+- `--no-serial` disables serial output entirely.
 - `--no-overlay` hides debug window.
+- `--start-paused` starts with scan mode OFF until toggled with `s`.
+- `--disable-closeness` turns off area-based urgency / `DANGER`.
 - `--confidence 0.4` adjusts threshold.
 - `--cooldown 1.2` adjusts repeat suppression.
+
+Recommended first full-integration run:
+```bash
+cd software
+python -m app.main --serial-port /dev/tty.usbmodem1101 --start-paused --confidence 0.45 --cooldown 1.25
+```
+
+This starts calmly, lets you confirm the feed first, then begin output with `s`.
 
 ## Configuration and Tuning
 Core defaults live in `software/app/config.py` and `software/app/constants.py`.
@@ -131,6 +141,11 @@ Tuning examples:
 - change port: `IRIS_SERIAL_PORT=/dev/tty.usbmodem1101`
 - change classes: `IRIS_TARGET_LABELS=person,chair,bottle`
 - change threshold: `IRIS_CONFIDENCE=0.4`
+
+Default demo behavior is intentionally conservative:
+- starts from `person` + `chair` only
+- uses a higher confidence threshold to reduce noisy obstacle spam
+- keeps obstacle-style detections available through `IRIS_TARGET_LABELS` when you want them
 
 The interpreter is designed so you can quickly adjust priorities and fallback object labels for your environment.
 
